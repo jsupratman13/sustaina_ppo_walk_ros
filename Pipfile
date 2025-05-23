@@ -1,0 +1,18 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+torch = "*"
+tensorboard = "*"
+rsl_rl = {git = 'https://github.com/leggedrobotics/rsl_rl', ref = 'v1.0.2', editable = true }
+rospkg = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.8"
+
+#[scripts]
+#setup = "bash setup.sh"
