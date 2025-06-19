@@ -1,6 +1,5 @@
 #!/usr/bin/env pipenv-shebang
 
-import os
 import pickle
 
 import numpy as np
@@ -12,294 +11,131 @@ from sensor_msgs.msg import Imu
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
-
-def inv_quat(quat):
-    if isinstance(quat, torch.Tensor):
-        scaling = torch.tensor([1, -1, -1, -1], device=quat.device)
-        return quat * scaling
-    elif isinstance(quat, np.ndarray):
-        scaling = np.array([1, -1, -1, -1], dtype=quat.dtype)
-        return quat * scaling
-    raise Exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
-
-
-def quat_to_xyz(quat):
-    if isinstance(quat, torch.Tensor):
-        # Extract quaternion components
-        qw, qx, qy, qz = quat.unbind(-1)
-        # Roll (x-axis rotation)
-        sinr_cosp = 2 * (qw * qx + qy * qz)
-        cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
-        roll = torch.atan2(sinr_cosp, cosr_cosp)
-        # Pitch (y-axis rotation)
-        sinp = 2 * (qw * qy - qz * qx)
-        pitch = torch.where(
-            torch.abs(sinp) >= 1,
-            torch.sign(sinp) * torch.tensor(torch.pi / 2),
-            torch.asin(sinp),
-        )
-        # Yaw (z-axis rotation)
-        siny_cosp = 2 * (qw * qz + qx * qy)
-        cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-        yaw = torch.atan2(siny_cosp, cosy_cosp)
-        return torch.stack([roll, pitch, yaw], dim=-1) * 180.0 / torch.tensor(np.pi)
-    elif isinstance(quat, np.ndarray):
-        return Rotation.from_quat(wxyz_to_xyzw(quat)).as_euler("xyz", degrees=True)
-    raise Exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
+# Joint order (ROS and RL are the same)
+joint_order = [
+    'left_shoulder_pitch_joint',
+    'left_shoulder_roll_joint',
+    'left_elbow_pitch_joint',
+    'left_waist_yaw_joint',
+    'left_waist_roll_joint',
+    'left_waist_pitch_joint',
+    'left_knee_pitch_joint',
+    'left_ankle_pitch_joint',
+    'left_ankle_roll_joint',
+    'right_shoulder_pitch_joint',
+    'right_shoulder_roll_joint',
+    'right_elbow_pitch_joint',
+    'right_waist_yaw_joint',
+    'right_waist_roll_joint',
+    'right_waist_pitch_joint',
+    'right_knee_pitch_joint',
+    'right_ankle_pitch_joint',
+    'right_ankle_roll_joint',
+]
 
 
-def transform_by_quat(v, quat):
-    if isinstance(v, torch.Tensor) and isinstance(quat, torch.Tensor):
-        qvec = quat[..., 1:]
-        t = qvec.cross(v, dim=-1) * 2
-        return v + quat[..., :1] * t + qvec.cross(t, dim=-1)
-    elif isinstance(v, np.ndarray) and isinstance(quat, np.ndarray):
-        return transform_by_R(v, quat_to_R(quat))
-    raise Exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
+class WalkPolicyRosBridge:
+    def __init__(self, exp_name, ckpt):
+        # Load configs and policy
+        log_dir = RosPack().get_path('sustaina_ppo_walk_ros') + '/logs'
+        # log_dir = f"logs/{exp_name}"
+        # env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg, domain_rand_cfg = pickle.load(open(f"{log_dir}/cfgs.pkl", "rb"))
+        env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg, domain_rand_cfg = pickle.load(
+            open(rospy.get_param('~train_config'), "rb"))
 
+        class DummyEnv:
+            def __init__(self):
+                self.num_privileged_obs = None
+                self.num_obs = obs_cfg['num_obs']
+                self.num_actions = env_cfg['num_actions']
+                self.num_envs = 1
+                self.reset = lambda **kwargs: (None, None)
 
-def transform_quat_by_quat(v, u):
-    if isinstance(v, torch.Tensor) and isinstance(u, torch.Tensor):
-        assert v.shape == u.shape, f"{v.shape} != {u.shape}"
-        w1, x1, y1, z1 = u[..., 0], u[..., 1], u[..., 2], u[..., 3]
-        w2, x2, y2, z2 = v[..., 0], v[..., 1], v[..., 2], v[..., 3]
-        ww = (z1 + x1) * (x2 + y2)
-        yy = (w1 - y1) * (w2 + z2)
-        zz = (w1 + y1) * (w2 - z2)
-        xx = ww + yy + zz
-        qq = 0.5 * (xx + (z1 - x1) * (x2 - y2))
-        w = qq - ww + (z1 - y1) * (y2 - z2)
-        x = qq - xx + (x1 + w1) * (x2 + w2)
-        y = qq - yy + (w1 - x1) * (y2 + z2)
-        z = qq - zz + (z1 + y1) * (w2 - x2)
-        quat = torch.stack([w, x, y, z], dim=-1)
-        return quat
-    elif isinstance(v, np.ndarray) and isinstance(u, np.ndarray):
-        assert v.shape == u.shape, f"{v.shape} != {u.shape}"
-        w1, x1, y1, z1 = u[..., 0], u[..., 1], u[..., 2], u[..., 3]
-        w2, x2, y2, z2 = v[..., 0], v[..., 1], v[..., 2], v[..., 3]
-        # This method transforms quat_v by quat_u
-        # This is equivalent to quatmul(quat_u, quat_v) or R_u @ R_v
-        ww = (z1 + x1) * (x2 + y2)
-        yy = (w1 - y1) * (w2 + z2)
-        zz = (w1 + y1) * (w2 - z2)
-        xx = ww + yy + zz
-        qq = 0.5 * (xx + (z1 - x1) * (x2 - y2))
-        w = qq - ww + (z1 - y1) * (y2 - z2)
-        x = qq - xx + (x1 + w1) * (x2 + w2)
-        y = qq - yy + (w1 - x1) * (y2 + z2)
-        z = qq - zz + (z1 + y1) * (w2 - x2)
-        quat = np.stack([w, x, y, z], axis=-1)
-        return quat
-    raise Exception(f"the input must be either torch.Tensor or np.ndarray. got: {type(quat)=}")
+        runner = OnPolicyRunner(DummyEnv(), train_cfg, log_dir, device="cuda:0")
+        resume_path = f"{log_dir}/model_{ckpt}.pt"
+        # runner.load(resume_path)
+        runner.load(rospy.get_param('~weight_path'))
+        self.policy = runner.get_inference_policy(device="cuda:0")
 
-
-class SustainaEnv(object):
-    def __init__(self,
-                 env_cfg: dict,
-                 obs_cfg: dict,
-                 command_cfg: dict,
-                 device: str = 'cuda'):
-        self.device = torch.device(device)
-
-        self.num_envs = 1
+        # Prepare obs and state arrays
         self.num_obs = obs_cfg['num_obs']
-        self.num_privileged_obs = None
-        self.num_actions = env_cfg['num_actions']
-        self.num_commands = command_cfg['num_commands']
+        self.joint_pos = np.zeros(18)
+        self.joint_vel = np.zeros(18)
+        self.last_actions = np.zeros(18)
+        self.imu_ang_vel = np.zeros(3)
+        self.ready = False
 
+        # Scales and defaults
         self.obs_scales = obs_cfg['obs_scales']
-        self.clip_action = env_cfg['clip_actions']
-        self.action_scale = env_cfg['action_scale']
-        self.default_dof_pos = torch.tensor(
-            [env_cfg['default_joint_angles'][name] for name in env_cfg['dof_names']],
-            device=self.device,
-            dtype=torch.float,
+        self.default_dof_pos = np.array(
+            [env_cfg['default_joint_angles'][jn] for jn in joint_order], dtype=np.float32
         )
-        self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=torch.float)
-        self.reset_buf = torch.ones((self.num_envs,), device=self.device, dtype=torch.long)
-        self.rew_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.float)
-        self.dof_names = env_cfg['dof_names']
-
-        self.commands = torch.zeros((self.num_envs, self.num_commands), device=self.device, dtype=torch.float)
-        self.actions = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.last_actions = torch.zeros_like(self.actions)
-        self.base_init_quat = torch.tensor(env_cfg['base_init_quat'], device=self.device)
-        self.inv_base_init_quat = inv_quat(self.base_init_quat)
-        self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-        self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.float)
-        self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-        self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-        self.projected_gravity = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
-        self.global_gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device,
-                                           dtype=torch.float).repeat(self.num_envs, 1)
-        self.dof_pos = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.dof_vel = torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=torch.float)
-        self.commands_scale = torch.tensor(
-            [self.obs_scales['lin_vel'], self.obs_scales['lin_vel'], self.obs_scales['ang_vel']],
-            device=self.device, dtype=torch.float)
+        self.clip_actions = env_cfg['clip_actions']
+        self.action_scale = env_cfg['action_scale']
 
         # ROS
-        self.cmd_pub = rospy.Publisher('joint_group_position_controller/command', Float64MultiArray, queue_size=1)
-        # self.imu_sub = rospy.Subscriber('imu/data', Imu, self.imu_callback)
-        self.joint_state_sub = rospy.Subscriber('joint_states', JointState, self.joint_state_callback)
-        # self.cmd_sub = rospy.Subscriber('command', Float64MultiArray, self.cmd_callback)
-
-        self.latest_imu_msg = None
-        self.latest_joint_state_msg = None
-
-    def imu_callback(self, msg):
-        self.latest_imu_msg = msg
-
-        # Update orientation: ROS gives (x,y,z,w)
-        quat = torch.tensor(
-            [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w],
-            device=self.device, dtype=torch.float
-        )
-        self.base_quat[0, :] = quat
-
-        # Update angular velocity:
-        ang_vel = torch.tensor(
-            [msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z],
-            device=self.device, dtype=torch.float
-        )
-        self.base_ang_vel[0, :] = ang_vel
+        rospy.Subscriber("joint_states", JointState, self.joint_state_callback)
+        rospy.Subscriber("imu/data", Imu, self.imu_callback)
+        self.joint_cmd_pub = rospy.Publisher(
+            "joint_group_position_controller/command",
+            Float64MultiArray,
+            queue_size=1)
 
     def joint_state_callback(self, msg):
-        self.latest_joint_state_msg = msg
+        name_to_idx = {name: i for i, name in enumerate(msg.name)}
+        for i, jn in enumerate(joint_order):
+            if jn in msg.name:
+                idx = msg.name.index(jn)
+                self.joint_pos[i] = msg.position[idx]
+                self.joint_vel[i] = 0.0  # msg.velocity[idx] if len(msg.velocity) > idx else 0.0
 
-        # Assume msg.name is a list of joint names and that env_cfg['dof_names'] gives the desired order.
-        pos = []
-        vel = []
-        for joint in self.dof_names:
-            if joint in msg.name:
-                idx = msg.name.index(joint)
-                pos.append(msg.position[idx])
-                vel.append(msg.velocity[idx])
-            else:
-                # If a joint is missing, fall back to default.
-                default_val = self.default_dof_pos[self.dof_names.index(joint)].item()
-                pos.append(default_val)
-                vel.append(0.0)
-        self.dof_pos[0, :] = torch.tensor(pos, device=self.device, dtype=torch.float)
-        self.dof_vel[0, :] = torch.tensor(vel, device=self.device, dtype=torch.float)
+        self.ready = True
 
-    def cmd_callback(self, msg):
-        cmd = torch.tensor(msg.data, device=self.device, dtype=torch.float)
-        if cmd.ndim == 1:
-            cmd = cmd.unsqueeze(0)
-        self.commands.copy_(cmd)
+    def imu_callback(self, msg):
+        # Only use angular velocity for this example; expand if needed
+        self.imu_ang_vel[0] = msg.angular_velocity.x
+        self.imu_ang_vel[1] = msg.angular_velocity.y
+        self.imu_ang_vel[2] = msg.angular_velocity.z
 
-    def get_observations(self):
-        return self.obs_buf
+    def build_observation(self):
+        obs = []
+        obs += list(self.imu_ang_vel * self.obs_scales['ang_vel'])  # 3
+        # obs += [0.0, 0.0, -1.0]   # Projected gravity (replace with real value if needed)
+        obs += [0.0, 0.0, 0.0]    # Command (set to zero, or change if you want walking)
+        obs += list((self.joint_pos - self.default_dof_pos) * self.obs_scales['dof_pos'])  # 18
+        # obs += list(self.joint_vel * self.obs_scales['dof_vel'] * 0.0)  # 18
+        obs += list(self.last_actions)  # 18
+        # Pad if less than num_obs
+        obs = np.array(obs, dtype=np.float32)
+        if obs.shape[0] < self.num_obs:
+            obs = np.pad(obs, (0, self.num_obs - obs.shape[0]))
+        return obs.reshape(1, -1)  # batch of one
 
-    def get_privileged_observations(self):
-        return None
-
-    def reset(self):
-        self.latest_imu_msg = None
-        self.latest_joint_state_msg = None
-        return self.obs_buf, None
-
-    def step(self, actions):
-        actions = torch.clip(actions, - self.clip_action, self.clip_action)
-        exec_actions = self.last_actions
-        target_dof_pos = exec_actions * self.action_scale + self.default_dof_pos
-        cmd_msg = Float64MultiArray()
-        cmd_msg.data = target_dof_pos.detach().cpu().numpy().flatten().tolist()
-        self.cmd_pub.publish(cmd_msg)
-
-        # update buffers
-        # self.base_quat[:]  # TODO: get quat
-        # self.base_euler = quat_to_xyz(
-        #     transform_quat_by_quat(torch.ones_like(self.base_quat * self.inv_base_init_quat), self.base_quat))
-        # inv_base_quat = inv_quat(self.base_quat)
-        # self.base_ang_vel  # TODO: get angular velocity
-        # self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
-        # self.dof_pos[:]  # TODO: get joint pos
-        # self.dof_vel[:]  # TODO: get joint vel
-
-        msg = rospy.wait_for_message('imu/data', Imu)
-        self.imu_callback(msg)
-        # if self.latest_imu_msg is not None:
-        #     quat = torch.tensor(
-        #         [self.latest_imu_msg.orientation.x, self.latest_imu_msg.orientation.y,
-        #          self.latest_imu_msg.orientation.z, self.latest_imu_msg.orientation.w],
-        #         device=self.device, dtype=torch.float
-        #     )
-        #     self.base_quat[0, :] = quat
-        #     ang_vel = torch.tensor(
-        #         [self.latest_imu_msg.angular_velocity.x, self.latest_imu_msg.angular_velocity.y,
-        #          self.latest_imu_msg.angular_velocity.z],
-        #         device=self.device, dtype=torch.float
-        #     )
-        #     self.base_ang_vel[0, :] = ang_vel
-
-        msg = rospy.wait_for_message('joint_states', JointState)
-        self.joint_state_callback(msg)
-        if self.latest_joint_state_msg is not None:
-            pos = []
-            vel = []
-            for joint in self.dof_names:
-                if joint in self.latest_joint_state_msg.name:
-                    idx = self.latest_joint_state_msg.name.index(joint)
-                    pos.append(self.latest_joint_state_msg.position[idx])
-                    vel.append(self.latest_joint_state_msg.velocity[idx])
-                else:
-                    # If a joint is missing, fall back to default.
-                    default_val = self.default_dof_pos[self.dof_names.index(joint)].item()
-                    pos.append(default_val)
-                    vel.append(0.0)
-            self.dof_pos[0, :] = torch.tensor(pos, device=self.device, dtype=torch.float)
-            self.dof_vel[0, :] = torch.tensor(vel, device=self.device, dtype=torch.float)
-
-        relative_quat = transform_quat_by_quat(
-            torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat)
-        self.base_euler = quat_to_xyz(relative_quat)
-        inv_base_quat = inv_quat(self.base_quat)
-        self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
-
-        # compute observations
-        self.obs_buf = torch.cat(
-            [
-                self.base_ang_vel * self.obs_scales['ang_vel'],
-                self.projected_gravity,
-                self.commands * self.commands_scale,
-                (self.dof_pos - self.default_dof_pos) * self.obs_scales['dof_pos'],
-                self.dof_vel * self.obs_scales['dof_vel'],
-                self.actions,
-            ],
-            axis=-1,
-        )
-
-        self.last_actions[:] = actions[:]
-
-        return self.obs_buf, None, self.rew_buf, self.reset_buf, {}
+    def step(self):
+        if not self.ready:
+            return
+        obs = self.build_observation()
+        obs_torch = torch.from_numpy(obs).to("cuda:0")
+        with torch.no_grad():
+            actions = self.policy(obs_torch)  # .cpu().numpy().flatten()
+            actions = torch.clip(actions, -self.clip_actions, self.clip_actions)
+            actions = actions.cpu().numpy().flatten()
+        self.last_actions = actions
+        msg = Float64MultiArray()
+        msg.data = (actions * self.action_scale + self.default_dof_pos).tolist()
+        self.joint_cmd_pub.publish(msg)
 
 
-class EvalWalk(object):
-    def __init__(self):
-        self.__weight = rospy.get_param('~weight_path')
-        self.__config = rospy.get_param('~train_config')
-        env_cfg, obs_cfg, _, command_cfg, train_cfg, _ = pickle.load(open(self.__config, 'rb'))
-        log_dir = RosPack().get_path('sustaina_walk_ros') + '/config/dummy'
-
-        env = SustainaEnv(env_cfg, obs_cfg, command_cfg)
-
-        runner = OnPolicyRunner(env, train_cfg, log_dir, device='cuda:0')
-        runner.load(self.__weight)
-        policy = runner.get_inference_policy(device='cuda:0')
-        obs, _ = env.reset()
-        rate = rospy.Rate(50)
-        while torch.no_grad():
-            while not rospy.is_shutdown():
-                actions = policy(obs)
-                obs, _, _, _, _ = env.step(actions)
-                rate.sleep()
+def main():
+    rospy.init_node('walk_policy_ros_bridge')
+    exp_name = rospy.get_param('~exp_name', 'sustaina-walking')
+    ckpt = rospy.get_param('~ckpt', 200)
+    bridge = WalkPolicyRosBridge(exp_name, ckpt)
+    rate = rospy.Rate(20)  # 50 Hz
+    while not rospy.is_shutdown():
+        bridge.step()
+        rate.sleep()
 
 
-if __name__ == '__main__':
-    rospy.init_node('sustaina_walk_ros')
-    evaluate = EvalWalk()
-
-    rospy.spin()
+if __name__ == "__main__":
+    main()

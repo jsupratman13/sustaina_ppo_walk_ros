@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
   <node name="sustaina_ppo_walk_ros" pkg="sustaina_ppo_walk_ros" type="eval_walk.py" output="screen">
-    <param name="~weight_path" value="$(find sustaina_ppo_walk_ros)/config/weights/model_500.pt"/>
-    <param name="~train_config" value="$(find sustaina_ppo_walk_ros)/config/cfgs.pkl"/>
+    <param name="~weight_path" value="$(find sustaina_ppo_walk_ros)/config/weights/model3_500.pt"/>
+    <param name="~train_config" value="$(find sustaina_ppo_walk_ros)/config/cfgs3.pkl"/>
   </node>
 </launch>
