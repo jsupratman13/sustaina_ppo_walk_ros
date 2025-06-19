@@ -5,6 +5,7 @@ import pickle
 import numpy as np
 import rospy
 import torch
+from geometry_msgs.msg import Twist
 from rospkg.rospack import RosPack
 from rsl_rl.runners import OnPolicyRunner
 from sensor_msgs.msg import Imu
@@ -72,6 +73,9 @@ class WalkPolicyRosBridge:
         )
         self.clip_actions = env_cfg['clip_actions']
         self.action_scale = env_cfg['action_scale']
+        self.linear_x_limit = command_cfg['lin_vel_x_range']
+        self.yaw_limit = command_cfg['ang_vel_range']
+        self.command = [0.0, 0.0, 0.0]
 
         # ROS
         rospy.Subscriber("joint_states", JointState, self.joint_state_callback)
@@ -80,6 +84,7 @@ class WalkPolicyRosBridge:
             "joint_group_position_controller/command",
             Float64MultiArray,
             queue_size=1)
+        rospy.Subscriber('cmd_vel', Twist, self.cmd_callback)
 
     def joint_state_callback(self, msg):
         name_to_idx = {name: i for i, name in enumerate(msg.name)}
@@ -97,11 +102,16 @@ class WalkPolicyRosBridge:
         self.imu_ang_vel[1] = msg.angular_velocity.y
         self.imu_ang_vel[2] = msg.angular_velocity.z
 
+    def cmd_callback(self, msg):
+        self.command[0] = np.clip(msg.linear.x, self.linear_x_limit[0], self.linear_x_limit[1])
+        self.command[1] = 0.0
+        self.command[2] = np.clip(msg.angular.x, self.yaw_limit[0], self.yaw_limit[1])
+
     def build_observation(self):
         obs = []
         obs += list(self.imu_ang_vel * self.obs_scales['ang_vel'])  # 3
         # obs += [0.0, 0.0, -1.0]   # Projected gravity (replace with real value if needed)
-        obs += [0.0, 0.0, 0.0]    # Command (set to zero, or change if you want walking)
+        obs += self.command    # Command (set to zero, or change if you want walking)
         obs += list((self.joint_pos - self.default_dof_pos) * self.obs_scales['dof_pos'])  # 18
         # obs += list(self.joint_vel * self.obs_scales['dof_vel'] * 0.0)  # 18
         obs += list(self.last_actions)  # 18

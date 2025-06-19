@@ -4,4 +4,5 @@
     <param name="~weight_path" value="$(find sustaina_ppo_walk_ros)/config/weights/model3_500.pt"/>
     <param name="~train_config" value="$(find sustaina_ppo_walk_ros)/config/cfgs3.pkl"/>
   </node>
+  <node name="teleop_twist_keyboard" pkg="teleop_twist_keyboard" type="teleop_twist_keyboard.py" output="screen"/>
 </launch>
